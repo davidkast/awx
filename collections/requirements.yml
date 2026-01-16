@@ -1,4 +1,5 @@
 ---
 collections:
   - name: community.general
-    version: 9.0.0  # Usaremos una versión muy estable para asegurar
+    version: 9.5.0
+    
