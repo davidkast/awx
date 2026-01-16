@@ -1,5 +1,6 @@
 # inventario_glpi.yml
-plugin: community.general.glpi
+#plugin: community.general.glpi
+plugin: glpi
 url: "http://172.20.69.164/apirest.php"  # Asegúrate de que termine en /apirest.php
 token: "pNfVzFI3GmBIFvnZOP1GrhQKK1852ItG1TMrV4oL"
 app_token: "T9XMuVtmId75PXtiQfo75u38RP0bAk3ImelpXp2q"
