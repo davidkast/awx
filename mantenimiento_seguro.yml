@@ -1,0 +1,38 @@
+---
+- name: Mantenimiento y Actualizaciones (Tipo Landscape)
+  hosts: all
+  become: yes
+  
+  tasks:
+    # 1. Protección: Agrupamos dinámicamente por Sistema Operativo
+    - name: Clasificar hosts por SO
+      group_by:
+        key: "os_{{ ansible_os_family }}"
+      changed_when: false
+
+- name: Tareas específicas para Servidores Debian/Ubuntu
+  hosts: os_Debian  # Solo se ejecuta en máquinas detectadas como Debian/Ubuntu
+  become: yes
+  tasks:
+    - name: Actualizar caché de repositorios (apt update)
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Actualizar todos los paquetes (apt upgrade)
+      apt:
+        upgrade: dist
+      register: upgrade_result
+
+    - name: Limpiar paquetes obsoletos (autoremove)
+      apt:
+        autoremove: yes
+
+    - name: Comprobar si es necesario reiniciar
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    - name: Mostrar resultado
+      debug:
+        msg: "Actualización completada. ¿Requiere reinicio?: {{ reboot_required_file.stat.exists }}"
