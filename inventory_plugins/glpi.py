@@ -7,9 +7,9 @@ import sys
 DOCUMENTATION = r'''
 name: glpi
 plugin_type: inventory
-short_description: Plugin GLPI con Grupos Automáticos (Windows/Linux)
+short_description: Inventory plugin for GLPI
 description:
-  - Recupera hosts, detecta IP y crea grupos por Sistema Operativo.
+  - Retrieves hosts from GLPI via REST API and sets ansible_host dynamically based on Public Contact Address
 options:
   plugin:
     required: true
@@ -27,17 +27,19 @@ class InventoryModule(BaseInventoryPlugin):
 
     def parse(self, inventory, loader, path, cache=True):
         super().parse(inventory, loader, path)
+
         config = self._read_config_data(path)
         
         glpi_url = config.get('glpi_url')
-        if not glpi_url: raise AnsibleError("glpi_url is required")
+        if not glpi_url:
+            raise AnsibleError("glpi_url is required")
         glpi_url = glpi_url.rstrip('/')
 
         app_token = os.getenv("GLPI_APP_TOKEN")
         user_token = os.getenv("GLPI_USER_TOKEN")
 
         if not app_token or not user_token:
-            raise AnsibleError("GLPI tokens missing env vars")
+            raise AnsibleError("GLPI tokens not found in environment variables")
 
         headers = {
             "App-Token": app_token,
@@ -45,111 +47,91 @@ class InventoryModule(BaseInventoryPlugin):
             "Content-Type": "application/json"
         }
 
+        # 1. INICIAR SESIÓN
         try:
-            # 1. INIT SESSION
             session = requests.get(f"{glpi_url}/initSession", headers=headers)
             session.raise_for_status()
-            headers["Session-Token"] = session.json()["session_token"]
-            
-            # 2. DETECTAR IDs DE CAMPOS (IP y OS)
-            print("INFO: Detecting fields...", file=sys.stderr)
-            opts = requests.get(f"{glpi_url}/listSearchOptions/Computer", headers=headers).json()
+            session_token = session.json()["session_token"]
+            headers["Session-Token"] = session_token
+        except Exception as e:
+            raise AnsibleError(f"CRITICAL: Failed to init GLPI session: {e}")
 
-            ip_id = None
-            os_id = None
-            
-            # Listas de prioridad (Minúsculas para comparar)
-            ip_priority = ["public contact address", "contact address", "ip address", "dirección ip"]
-            # AQUI ESTA EL CAMBIO: Añadido "sistema operativo - nombre"
-            os_priority = ["sistema operativo - nombre", "operating system - name", "sistema operativo", "operating system", "système d'exploitation"]
+        try:
+            # 2. AUTODETECTAR EL ID DEL CAMPO CORRECTO
+            print("INFO: Detecting IP field ID...", file=sys.stderr)
+            opts_req = requests.get(f"{glpi_url}/listSearchOptions/Computer", headers=headers)
+            opts_req.raise_for_status()
+            search_options = opts_req.json()
 
-            for key, val in opts.items():
+            ip_field_id = None
+            
+            # Lista de nombres a buscar en orden de preferencia
+            # "public contact address" es el que usa tu agente GLPI
+            priority_names = ["public contact address", "contact address", "ip address", "dirección ip"]
+
+            for key, val in search_options.items():
                 if isinstance(val, dict) and "name" in val:
-                    fname = val["name"].lower()
+                    field_name = val["name"].lower()
                     
-                    # Detectar IP
-                    if not ip_id:
-                        for p_ip in ip_priority:
-                            if p_ip in fname:
-                                if "public" in fname: # Prioridad absoluta
-                                    ip_id = key
-                                    print(f"DEBUG: IP Field FOUND (High Priority): '{val['name']}' (ID: {key})", file=sys.stderr)
-                                    break
-                                elif ip_id is None: # Si no tenemos ninguno, cogemos el primero que coincida
-                                    ip_id = key
-                                    print(f"DEBUG: IP Field Candidate: '{val['name']}' (ID: {key})", file=sys.stderr)
-
-                    # Detectar SO
-                    if not os_id:
-                        for p_os in os_priority:
-                            if p_os in fname:
-                                os_id = key
-                                print(f"DEBUG: OS Field FOUND: '{val['name']}' (ID: {key})", file=sys.stderr)
+                    # Chequeamos si el nombre del campo coincide con alguno de nuestra lista prioritaria
+                    for p_name in priority_names:
+                        if p_name in field_name:
+                            print(f"DEBUG: Found candidate field: ID {key} - Name: {val['name']}", file=sys.stderr)
+                            ip_field_id = key
+                            # Si encontramos "public contact address", rompemos el bucle y nos quedamos con este.
+                            if "public" in field_name:
                                 break
+                    if ip_field_id and "public" in field_name:
+                         break
             
-            # Fallbacks si no detecta nada
-            if not ip_id: 
-                ip_id = "31"
-                print("WARNING: IP field not detected. Using default ID 31.", file=sys.stderr)
-            if not os_id: 
-                os_id = "45"
-                print("WARNING: OS field not detected. Using default ID 45.", file=sys.stderr)
-            
-            print(f"INFO: FINAL IDs -> IP: {ip_id} | OS: {os_id}", file=sys.stderr)
+            if not ip_field_id:
+                print("WARNING: Could not auto-detect fields. Defaulting to standard ID 31.", file=sys.stderr)
+                ip_field_id = "31" 
+            else:
+                print(f"INFO: Using ID {ip_field_id} for IP Address extraction.", file=sys.stderr)
 
             # 3. BUSCAR EQUIPOS
-            params = {
-                "forcedisplay[0]": "1",      # Nombre
-                "forcedisplay[1]": ip_id,    # IP
-                "forcedisplay[2]": os_id,    # OS
+            search_params = {
+                "forcedisplay[0]": "1",          # Nombre
+                "forcedisplay[1]": ip_field_id,  # La IP detectada
                 "range": "0-1000"
             }
-            
-            # search devuelve { totalcount: X, data: [ ... ] }
-            resp = requests.get(f"{glpi_url}/search/Computer", headers=headers, params=params).json()
-            data = resp.get("data", [])
 
-            # 4. PROCESAR HOSTS Y GRUPOS
-            # Creamos los grupos explícitamente
-            inventory.add_group("windows")
-            inventory.add_group("linux")
-            inventory.add_group("otros")
+            req = requests.get(f"{glpi_url}/search/Computer", headers=headers, params=search_params)
+            req.raise_for_status()
+            
+            raw_response = req.json()
+            data = raw_response.get("data", [])
+
+            print(f"INFO: Found {raw_response.get('totalcount', 0)} computers.", file=sys.stderr)
 
             for item in data:
-                # El campo '1' siempre es el nombre del equipo
-                name = item.get("1")
-                
-                # Recuperamos los valores usando los IDs detectados
-                raw_ip = item.get(str(ip_id))
-                raw_os = item.get(str(os_id)) 
+                hostname = item.get("1")
+                raw_ip = item.get(str(ip_field_id))
 
-                if not name: continue
-                
-                inventory.add_host(name)
+                if not hostname:
+                    continue
 
-                # -- Lógica de IP --
+                inventory.add_host(hostname)
+                
                 if raw_ip:
-                    # Limpieza de IP (quitar <br> y coger la primera)
-                    ip = str(raw_ip).replace("<br>", "\n").split("\n")[0].strip()
-                    if "." in ip: 
-                        inventory.set_variable(name, "ansible_host", ip)
-
-                # -- Lógica de Grupos (Windows vs Linux) --
-                os_name = str(raw_os).lower() if raw_os else "desconocido"
-                
-                # Debug para ver qué está leyendo realmente
-                # print(f"DEBUG HOST: {name} | OS RAW: {raw_os}", file=sys.stderr)
-
-                if "windows" in os_name:
-                    inventory.add_child("windows", name)
-                elif any(x in os_name for x in ["linux", "ubuntu", "debian", "red hat", "centos", "fedora", "suse"]):
-                    inventory.add_child("linux", name)
-                else:
-                    inventory.add_child("otros", name)
+                    # Limpiamos saltos de línea y etiquetas HTML si las hubiera
+                    clean_ip = str(raw_ip).replace("<br>", "\n").split("\n")[0].strip()
                     
+                    # Validamos que parezca una IP (que tenga puntos)
+                    if "." in clean_ip:
+                        inventory.set_variable(hostname, "ansible_host", clean_ip)
+                    else:
+                        print(f"DEBUG: Host {hostname} has invalid IP content: {clean_ip}", file=sys.stderr)
+                else:
+                    print(f"WARNING: Host {hostname} has no IP in field {ip_field_id}", file=sys.stderr)
+
         except Exception as e:
-            print(f"ERROR CRITICO: {e}", file=sys.stderr)
-            raise AnsibleError(e)
+            print(f"CRITICAL ERROR: {e}", file=sys.stderr)
+            raise AnsibleError(f"Plugin Failed: {e}")
+
         finally:
-            try: requests.get(f"{glpi_url}/killSession", headers=headers)
-            except: pass
+            try:
+                requests.get(f"{glpi_url}/killSession", headers=headers)
+            except:
+                pass
