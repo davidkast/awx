@@ -7,9 +7,7 @@ import sys
 DOCUMENTATION = r'''
 name: glpi
 plugin_type: inventory
-short_description: Inventory plugin for GLPI
-description:
-  - Retrieves hosts from GLPI via REST API
+short_description: Debugging GLPI Groups
 options:
   plugin:
     required: true
@@ -27,103 +25,93 @@ class InventoryModule(BaseInventoryPlugin):
 
     def parse(self, inventory, loader, path, cache=True):
         super().parse(inventory, loader, path)
-
         config = self._read_config_data(path)
-
-        glpi_url = config.get('glpi_url')
-        if not glpi_url:
-            raise AnsibleError("glpi_url is required")
-        glpi_url = glpi_url.rstrip('/')
-
-        app_token = os.getenv("GLPI_APP_TOKEN")
-        user_token = os.getenv("GLPI_USER_TOKEN")
-
-        if not app_token or not user_token:
-            raise AnsibleError("GLPI tokens not found in environment variables")
-
+        
+        glpi_url = config.get('glpi_url').rstrip('/')
         headers = {
-            "App-Token": app_token,
-            "Authorization": f"user_token {user_token}",
+            "App-Token": os.getenv("GLPI_APP_TOKEN"),
+            "Authorization": f"user_token {os.getenv('GLPI_USER_TOKEN')}",
             "Content-Type": "application/json"
         }
 
         try:
+            # 1. INIT
             session = requests.get(f"{glpi_url}/initSession", headers=headers)
             session.raise_for_status()
-            session_token = session.json()["session_token"]
-            headers["Session-Token"] = session_token
-        except Exception as e:
-            raise AnsibleError(f"Failed to init GLPI session: {e}")
+            headers["Session-Token"] = session.json()["session_token"]
+            
+            # 2. DETECTAR CAMPOS
+            print("--- INICIO DEPURACION CAMPOS ---", file=sys.stderr)
+            opts = requests.get(f"{glpi_url}/listSearchOptions/Computer", headers=headers).json()
+            
+            ip_id = "31"  # Fallback
+            os_id = "45"  # Fallback
+            
+            # Buscar IDs
+            for key, val in opts.items():
+                if isinstance(val, dict):
+                    name = val.get("name", "").lower()
+                    
+                    # IP: Buscamos 'public contact' o 'contact address'
+                    if "public contact" in name: 
+                        ip_id = key
+                        print(f"DETECTADO CAMPO IP: '{val['name']}' -> ID: {key}", file=sys.stderr)
+                    
+                    # OS: Buscamos 'sistema operativo - nombre' o versiones similares
+                    if "sistema operativo" in name and "nombre" in name:
+                        os_id = key
+                        print(f"DETECTADO CAMPO SO: '{val['name']}' -> ID: {key}", file=sys.stderr)
+                    elif "operating system" in name and "name" in name:
+                         os_id = key
+                         print(f"DETECTADO CAMPO SO: '{val['name']}' -> ID: {key}", file=sys.stderr)
 
-        try:
-            opts_req = requests.get(f"{glpi_url}/listSearchOptions/Computer", headers=headers)
-            opts_req.raise_for_status()
-            search_options = opts_req.json()
+            print(f"IDs FINALES USADOS -> IP: {ip_id} | OS: {os_id}", file=sys.stderr)
 
-            ip_field_id = None
-            os_field_id = None
-
-            for key, val in search_options.items():
-                if not isinstance(val, dict):
-                    continue
-                name = val.get("name", "").lower()
-
-                if not ip_field_id and "public contact address" in name:
-                    ip_field_id = key
-
-                if not os_field_id and "operating system" in name:
-                    os_field_id = key
-
-            if not ip_field_id:
-                ip_field_id = "31"
-
-            if not os_field_id:
-                os_field_id = "10"
-
-            search_params = {
-                "forcedisplay[0]": "1",
-                "forcedisplay[1]": ip_field_id,
-                "forcedisplay[2]": os_field_id,
-                "range": "0-2000"
+            # 3. BUSQUEDA
+            params = {
+                "forcedisplay[0]": "1",      # Nombre
+                "forcedisplay[1]": ip_id,    # IP
+                "forcedisplay[2]": os_id,    # OS
+                "range": "0-1000"
             }
+            
+            data = requests.get(f"{glpi_url}/search/Computer", headers=headers, params=params).json().get("data", [])
 
-            req = requests.get(
-                f"{glpi_url}/search/Computer",
-                headers=headers,
-                params=search_params
-            )
-            req.raise_for_status()
-
-            data = req.json().get("data", [])
-
+            # 4. CREAR GRUPOS
             inventory.add_group("linux")
             inventory.add_group("windows")
+            inventory.add_group("otros")
 
+            print("--- ANALISIS DE EQUIPOS ---", file=sys.stderr)
             for item in data:
-                hostname = item.get("1")
-                raw_ip = item.get(str(ip_field_id))
-                os_name = str(item.get(str(os_field_id), "")).lower()
-
-                if not hostname:
-                    continue
-
-                inventory.add_host(hostname)
-
+                name = item.get("1")
+                if not name: continue
+                
+                inventory.add_host(name)
+                
+                # IP
+                raw_ip = item.get(str(ip_id))
                 if raw_ip:
-                    clean_ip = str(raw_ip).replace("<br>", "\n").split("\n")[0].strip()
-                    if "." in clean_ip:
-                        inventory.set_variable(hostname, "ansible_host", clean_ip)
+                    ip = str(raw_ip).replace("<br>", "\n").split("\n")[0].strip()
+                    if "." in ip: inventory.set_variable(name, "ansible_host", ip)
 
-                if "windows" in os_name:
-                    inventory.add_host(hostname, group="windows")
-                elif any(x in os_name for x in ["linux", "ubuntu", "debian", "centos", "red hat", "rocky", "alma"]):
-                    inventory.add_host(hostname, group="linux")
+                # GRUPOS (Aquí es donde miraremos el log)
+                raw_os = item.get(str(os_id))
+                os_str = str(raw_os).lower() if raw_os else "nulo"
+                
+                print(f"EQUIPO: {name} | VALOR RAW SO: '{raw_os}' | VALOR LOWER: '{os_str}'", file=sys.stderr)
+
+                if "windows" in os_str:
+                    inventory.add_child("windows", name)
+                    print(f" -> Asignado a WINDOWS", file=sys.stderr)
+                elif any(x in os_str for x in ["linux", "ubuntu", "debian", "red hat"]):
+                    inventory.add_child("linux", name)
+                    print(f" -> Asignado a LINUX", file=sys.stderr)
+                else:
+                    inventory.add_child("otros", name)
+                    print(f" -> Asignado a OTROS", file=sys.stderr)
 
         except Exception as e:
-            raise AnsibleError(f"Plugin Failed: {e}")
-
+            print(f"ERROR: {e}", file=sys.stderr)
         finally:
-            try:
-                requests.get(f"{glpi_url}/killSession", headers=headers)
-            except:
-                pass
+            requests.get(f"{glpi_url}/killSession", headers=headers)
