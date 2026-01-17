@@ -1,0 +1,2 @@
+plugin: glpi
+glpi_url: http://172.20.69.164/apirest.php
