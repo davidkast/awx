@@ -1,6 +1,6 @@
 ---
 - name: Mantenimiento y Actualizaciones (Tipo Landscape)
-  hosts: all
+  hosts: linux
   become: yes
   
   tasks:
