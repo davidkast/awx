@@ -1,6 +1,6 @@
 ---
 - name: Instalar utilidad NCDU
-  hosts: all
+  hosts: linux
   become: yes  # Importante: para actuar como root (sudo)
   tasks:
     - name: Actualizar caché de apt (solo si es necesario)
