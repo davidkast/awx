@@ -1,0 +1,14 @@
+---
+- name: Instalar utilidad NCDU
+  hosts: all
+  become: yes  # Importante: para actuar como root (sudo)
+  tasks:
+    - name: Actualizar caché de apt (solo si es necesario)
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600 # No actualiza si ya se hizo hace menos de 1h
+
+    - name: Asegurar que ncdu está instalado
+      apt:
+        name: ncdu
+        state: present
